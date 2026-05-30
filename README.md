@@ -1,4 +1,4 @@
-# FrameFix
+﻿# FrameFix
 
 An [Ashita v4](https://www.ashitaxi.com/) plugin for **Final Fantasy XI**.
 
@@ -77,3 +77,9 @@ Released under the MIT License. See [LICENSE](LICENSE).
 ## Credits
 
 Created by **rockerudon**.
+
+## Support
+
+If you find this project useful, you can support development here:
+
+<a href="https://www.buymeacoffee.com/rockmizx" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50" width="210"></a>
