@@ -1,0 +1,17 @@
+# Build intermediates
+build/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# Keep the released DLL in dist/, ignore stray copies elsewhere
+/*.dll
+
+# Editor / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
