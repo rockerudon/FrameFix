@@ -1216,18 +1216,15 @@ namespace
         // even at a steady ~60 FPS, so the scalar bounced too, making the
         // animation step irregularly and sometimes look like it walks in place.
         //
-        // Fix: smooth the frame time itself with a long exponential moving
-        // average (~400ms window) and compute the scalar from that. With a
-        // stable framerate the averaged dt barely moves, so the scalar is
-        // effectively constant and the animation steps evenly. It still tracks
-        // a real sustained framerate drop, just without reacting to per-frame
-        // noise.
+        // Fix: smooth the frame time itself and compute the scalar from that.
+        // Keep the window short enough that recovery from a brief FPS dip does
+        // not keep animations over-compensated after the scene has stabilized.
         // ============================================================
         if (g_avgFrameMs <= 0.0)
             g_avgFrameMs = dtMs;
         else
         {
-            const double avgTimeConstantMs = 200.0;
+            const double avgTimeConstantMs = 65.0;
             double a = 1.0 - std::exp(-dtMs / avgTimeConstantMs);
             if (a < 0.0) a = 0.0;
             if (a > 1.0) a = 1.0;
@@ -1251,7 +1248,7 @@ namespace
 
         // Light additional smoothing on the scalar itself. Since the frame time
         // is already averaged, this just removes any remaining small steps.
-        const double timeConstantMs = 120.0;
+        const double timeConstantMs = 65.0;
         float alpha = static_cast<float>(1.0 - std::exp(-dtMs / timeConstantMs));
         if (alpha < 0.05f)
             alpha = 0.05f;
@@ -1577,7 +1574,7 @@ public:
 
     double GetVersion(void) const override
     {
-        return 1.0;
+        return 1.1;
     }
 
     uint32_t GetFlags(void) const override
