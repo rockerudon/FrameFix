@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <vector>
 
 #pragma comment(linker, "/EXPORT:expCreatePlugin=_expCreatePlugin@4")
 #pragma comment(linker, "/EXPORT:expGetInterfaceVersion=_expGetInterfaceVersion@0")
@@ -42,13 +41,13 @@ namespace
     uintptr_t g_nativeChatWinPtr2Location = 0;
     float g_minScalar                = 1.0f;
     float g_maxScalar                = 4.0f;
+    constexpr uint32_t kAnimationScalarHistoryCount = 4;
     float g_animationScalar          = 1.0f;
     float g_animationRawScalar       = 1.0f;
     float g_animationTargetScalar    = 1.0f;
-    float g_animationCompensation    = 1.0f;
+    float g_animationScalarHistory[kAnimationScalarHistoryCount] = {1.0f, 1.0f, 1.0f, 1.0f};
     bool g_animationScalarInitialized = false;
-    double g_avgFrameMs              = 0.0;  // long EMA of frame time for stable scalar
-    int32_t g_animationTimingMode    = 0;
+    uint32_t g_animationScalarHistoryIndex = 0;
     bool g_uiTickHookEnabled         = false;
     uint32_t g_menuExtraMethodPasses = 0;
     uint32_t g_chatExtraUpdatePasses = 0;
@@ -68,6 +67,7 @@ namespace
     bool g_uiRootCatchupEnabled           = false;
     bool g_uiRootUpdateInside             = false;
     uint32_t g_uiRootExtraPasses          = 0;
+    double g_uiRootTickCarry              = 0.0;
     float g_uiRootSmoothFactor            = 0.555555582f;
     float g_uiRootMaxStep                 = 1.0f;
     float g_uiRootMinStep                 = -1.0f;
@@ -377,17 +377,10 @@ namespace
         return false;
     }
 
-    std::vector<uintptr_t> find_time_scalar_functions()
+    bool looks_like_time_scalar_function(const uintptr_t address)
     {
-        std::vector<uintptr_t> result;
-
-        uintptr_t base = 0;
-        uint32_t size  = 0;
-        if (!get_module_range("FFXiMain.dll", base, size) && !get_module_range("ffximain.dll", base, size))
-            return result;
-
-        // Original helper used by animation/timer code:
-        // mov ecx, [state_ptr]; fld [ecx+28h]; fcomp [one]; ...; return min([ecx+28h], 1.0)
+        // GameManager::CheckTick-like helper:
+        // mov ecx, [state_ptr]; fld [ecx+28h]; fcomp [one]; ...; ret
         static const uint8_t pattern[] = {
             0x8B, 0x0D, 0x00, 0x00, 0x00, 0x00, 0xD9, 0x41, 0x28, 0xD8, 0x1D, 0x00, 0x00,
             0x00, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x07, 0xD9, 0x05, 0x00, 0x00,
@@ -395,18 +388,110 @@ namespace
         };
         static const char mask[] = "xx????xxxxx????xxxxxxxxx????xxxxx";
 
+        return matches(reinterpret_cast<const uint8_t*>(address), pattern, mask, sizeof(pattern));
+    }
+
+    uintptr_t relative_call_target(const uintptr_t callsite)
+    {
+        uint8_t opcode = 0;
+        int32_t relative = 0;
+        if (!safe_read(callsite, opcode) || opcode != 0xE8 || !safe_read(callsite + 1, relative))
+            return 0;
+
+        return callsite + 5 + static_cast<intptr_t>(relative);
+    }
+
+    uintptr_t find_animation_frame_tick_callsite()
+    {
+        uintptr_t base = 0;
+        uint32_t size  = 0;
+        if (!get_module_range("FFXiMain.dll", base, size) && !get_module_range("ffximain.dll", base, size))
+            return 0;
+
+        // AnimationTrack::UpdateFrame, found from XIClient:
+        // sub esp,0Ch; push esi; mov esi,ecx; push edi; mov eax,[esi+34h]; lea edi,[esi+34h]
+        static const uint8_t functionPattern[] = {
+            0x83, 0xEC, 0x0C, 0x56, 0x8B, 0xF1, 0x57, 0x8B,
+            0x46, 0x34, 0x8D, 0x7E, 0x34, 0x85, 0xC0,
+        };
+        static const char functionMask[] = "xxxxxxxxxxxxxxx";
+
+        // call CheckTick; fmul [esp+10h]; fadd [esi+24h]; fstp [esi+24h]
+        static const uint8_t callPattern[] = {
+            0xE8, 0x00, 0x00, 0x00, 0x00,
+            0xD8, 0x4C, 0x24, 0x10,
+            0xD8, 0x46, 0x24,
+            0xD9, 0x5E, 0x24,
+        };
+        static const char callMask[] = "x????xxxxxxxxxx";
+
+        for (uint32_t offset = 0; offset + sizeof(functionPattern) <= size; ++offset)
+        {
+            const uintptr_t function = base + offset;
+            const auto current = reinterpret_cast<const uint8_t*>(function);
+            if (!matches(current, functionPattern, functionMask, sizeof(functionPattern)))
+                continue;
+
+            const uint32_t searchEnd = (offset + 0x260 < size) ? 0x260 : size - offset;
+            for (uint32_t inner = 0x40; inner + sizeof(callPattern) <= searchEnd; ++inner)
+            {
+                const uintptr_t callsite = function + inner;
+                const auto callBytes = reinterpret_cast<const uint8_t*>(callsite);
+                if (!matches(callBytes, callPattern, callMask, sizeof(callPattern)))
+                    continue;
+
+                const uintptr_t target = relative_call_target(callsite);
+                if (target < base || target >= base + size)
+                    continue;
+
+                if (!looks_like_time_scalar_function(target))
+                    continue;
+
+                return callsite;
+            }
+        }
+
+        return 0;
+    }
+
+    uintptr_t find_animation_blend_tick_callsite()
+    {
+        uintptr_t base = 0;
+        uint32_t size  = 0;
+        if (!get_module_range("FFXiMain.dll", base, size) && !get_module_range("ffximain.dll", base, size))
+            return 0;
+
+        // AnimationTrack::UpdateBlendState, found from XIClient:
+        // push ecx; push esi; mov esi,ecx; call CheckTick; fstp [esp+4]; ...
+        static const uint8_t pattern[] = {
+            0x51, 0x56, 0x8B, 0xF1,
+            0xE8, 0x00, 0x00, 0x00, 0x00,
+            0xD9, 0x5C, 0x24, 0x04,
+            0x33, 0xC0,
+            0xB9, 0x00, 0x00, 0x80, 0x3F,
+            0x8A, 0x46, 0x08,
+        };
+        static const char mask[] = "xxxxx????xxxxxxxxxxxxxx";
+
         for (uint32_t offset = 0; offset + sizeof(pattern) <= size; ++offset)
         {
-            const auto current = reinterpret_cast<const uint8_t*>(base + offset);
+            const uintptr_t function = base + offset;
+            const auto current = reinterpret_cast<const uint8_t*>(function);
             if (!matches(current, pattern, mask, sizeof(pattern)))
                 continue;
 
-            result.push_back(base + offset);
-            if (result.size() == 2)
-                break;
+            const uintptr_t callsite = function + 4;
+            const uintptr_t target = relative_call_target(callsite);
+            if (target < base || target >= base + size)
+                continue;
+
+            if (!looks_like_time_scalar_function(target))
+                continue;
+
+            return callsite;
         }
 
-        return result;
+        return 0;
     }
 
     uintptr_t find_chat_root_update_callsite(uintptr_t& originalFunction)
@@ -497,26 +582,6 @@ namespace
         return 0;
     }
 
-    bool write_jump(PatchSite& site, void* destination)
-    {
-        DWORD oldProtect = 0;
-        if (!::VirtualProtect(reinterpret_cast<void*>(site.address), 5, PAGE_EXECUTE_READWRITE, &oldProtect))
-            return false;
-
-        std::memcpy(site.original, reinterpret_cast<void*>(site.address), sizeof(site.original));
-
-        const auto relative = reinterpret_cast<intptr_t>(destination) - static_cast<intptr_t>(site.address) - 5;
-        auto* bytes         = reinterpret_cast<uint8_t*>(site.address);
-        bytes[0]            = 0xE9;
-        *reinterpret_cast<int32_t*>(bytes + 1) = static_cast<int32_t>(relative);
-
-        ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(site.address), 5);
-        DWORD unused = 0;
-        ::VirtualProtect(reinterpret_cast<void*>(site.address), 5, oldProtect, &unused);
-        site.patched = true;
-        return true;
-    }
-
     bool write_call(PatchSite& site, void* destination)
     {
         DWORD oldProtect = 0;
@@ -552,27 +617,6 @@ namespace
         DWORD unused = 0;
         ::VirtualProtect(reinterpret_cast<void*>(site.address), 5, oldProtect, &unused);
         site.patched = false;
-        return true;
-    }
-
-    bool write_nops(BytesPatchSite& site, const uintptr_t address, const uint32_t length)
-    {
-        if (length == 0 || length > sizeof(site.original))
-            return false;
-
-        DWORD oldProtect = 0;
-        if (!::VirtualProtect(reinterpret_cast<void*>(address), length, PAGE_EXECUTE_READWRITE, &oldProtect))
-            return false;
-
-        site.address = address;
-        site.length  = length;
-        std::memcpy(site.original, reinterpret_cast<void*>(address), length);
-        std::memset(reinterpret_cast<void*>(address), 0x90, length);
-
-        ::FlushInstructionCache(::GetCurrentProcess(), reinterpret_cast<void*>(address), length);
-        DWORD unused = 0;
-        ::VirtualProtect(reinterpret_cast<void*>(address), length, oldProtect, &unused);
-        site.patched = true;
         return true;
     }
 
@@ -1194,13 +1238,15 @@ namespace
         return value;
     }
 
-    float apply_animation_compensation_strength(float value)
+    void reset_animation_scalar_state()
     {
-        value = clamp_animation_scalar(value);
-        if (value <= 1.0f)
-            return value;
-
-        return clamp_animation_scalar(1.0f + ((value - 1.0f) * g_animationCompensation));
+        g_animationScalar = 1.0f;
+        g_animationRawScalar = 1.0f;
+        g_animationTargetScalar = 1.0f;
+        for (auto& sample : g_animationScalarHistory)
+            sample = 1.0f;
+        g_animationScalarInitialized = false;
+        g_animationScalarHistoryIndex = 0;
     }
 
     void update_animation_scalar_from_frame(const double dtMs)
@@ -1208,59 +1254,37 @@ namespace
         if (dtMs <= 0.001 || dtMs > 250.0)
             return;
 
-        // ============================================================
-        // Stable frame-time averaging.
-        //
-        // The walk-animation jitter the user sees comes from feeding the raw
-        // per-frame dt into the scalar: frame times bounce (11ms, 23ms, 16ms)
-        // even at a steady ~60 FPS, so the scalar bounced too, making the
-        // animation step irregularly and sometimes look like it walks in place.
-        //
-        // Fix: smooth the frame time itself and compute the scalar from that.
-        // Keep the window short enough that recovery from a brief FPS dip does
-        // not keep animations over-compensated after the scene has stabilized.
-        // ============================================================
-        if (g_avgFrameMs <= 0.0)
-            g_avgFrameMs = dtMs;
-        else
+        // XIClient's GameManager smooths CheckTick with a tiny four-sample
+        // history. Mirroring that here keeps animation timing faithful without
+        // the long EMA tail that could leave motion accelerated after FPS
+        // recovered from a dip.
+        const float raw = clamp_animation_scalar(static_cast<float>(dtMs * 60.0 / 1000.0));
+        g_animationRawScalar = raw;
+
+        if (!g_animationScalarInitialized)
         {
-            const double avgTimeConstantMs = 65.0;
-            double a = 1.0 - std::exp(-dtMs / avgTimeConstantMs);
-            if (a < 0.0) a = 0.0;
-            if (a > 1.0) a = 1.0;
-            g_avgFrameMs += (dtMs - g_avgFrameMs) * a;
+            for (auto& sample : g_animationScalarHistory)
+                sample = raw;
+            g_animationScalarHistoryIndex = 0;
+            g_animationTargetScalar = raw;
+            g_animationScalar = std::fabs(raw - 1.0f) <= 0.04f ? 1.0f : raw;
+            g_animationScalarInitialized = true;
+            return;
         }
 
-        float target = static_cast<float>(g_avgFrameMs * 60.0 / 1000.0);
-        target = clamp_animation_scalar(target);
-        g_animationRawScalar = target;
+        g_animationScalarHistoryIndex = (g_animationScalarHistoryIndex + 1) % kAnimationScalarHistoryCount;
+        g_animationScalarHistory[g_animationScalarHistoryIndex] = raw;
+
+        float target = 0.0f;
+        for (const auto sample : g_animationScalarHistory)
+            target += sample;
+        target = clamp_animation_scalar(target / static_cast<float>(kAnimationScalarHistoryCount));
         g_animationTargetScalar = target;
 
         if (std::fabs(target - 1.0f) <= 0.04f)
             target = 1.0f;
 
-        if (!g_animationScalarInitialized)
-        {
-            g_animationScalar = target;
-            g_animationScalarInitialized = true;
-            return;
-        }
-
-        // Light additional smoothing on the scalar itself. Since the frame time
-        // is already averaged, this just removes any remaining small steps.
-        const double timeConstantMs = 65.0;
-        float alpha = static_cast<float>(1.0 - std::exp(-dtMs / timeConstantMs));
-        if (alpha < 0.05f)
-            alpha = 0.05f;
-        if (alpha > 1.0f)
-            alpha = 1.0f;
-
-        g_animationScalar += (target - g_animationScalar) * alpha;
-
-        if (std::fabs(g_animationScalar - 1.0f) <= 0.02f)
-            g_animationScalar = 1.0f;
-
-        g_animationScalar = clamp_animation_scalar(g_animationScalar);
+        g_animationScalar = target;
     }
 
     void update_ui_root_smoothing_from_frame(const double dtMs)
@@ -1279,7 +1303,7 @@ namespace
         g_uiRootMinStep = -scalar;
     }
 
-    extern "C" __declspec(noinline) float __stdcall real_time_scalar_hook()
+    float animation_time_scalar_base()
     {
         uintptr_t state = 0;
         if (g_statePointerLocation == 0 || !safe_read(g_statePointerLocation, state) || state == 0)
@@ -1289,12 +1313,40 @@ namespace
         if (safe_read(state + 0x30, divisor) && divisor != 1)
             return 1.0f;
 
-        float value = g_animationScalarInitialized ? g_animationScalar : 1.0f;
-        if (!g_animationScalarInitialized && !safe_read(state + 0x2C, value))
-            value = 1.0f;
+        const float value = g_animationScalarInitialized ? g_animationScalar : 1.0f;
+        return clamp_animation_scalar(value);
+    }
 
-        value = clamp_animation_scalar(value);
-        return value;
+    extern "C" __declspec(noinline) float __cdecl animation_track_frame_time_scalar(const uintptr_t)
+    {
+        return animation_time_scalar_base();
+    }
+
+    extern "C" __declspec(noinline) float __cdecl animation_track_blend_time_scalar(const uintptr_t)
+    {
+        return animation_time_scalar_base();
+    }
+
+    extern "C" __declspec(naked) void animation_frame_time_scalar_hook()
+    {
+        __asm
+        {
+            push esi
+            call animation_track_frame_time_scalar
+            add esp, 4
+            ret
+        }
+    }
+
+    extern "C" __declspec(naked) void animation_blend_time_scalar_hook()
+    {
+        __asm
+        {
+            push esi
+            call animation_track_blend_time_scalar
+            add esp, 4
+            ret
+        }
     }
 
     extern "C" __declspec(noinline) void __fastcall ui_component_update_hook(void* self, void*, int scaled)
@@ -1518,39 +1570,6 @@ namespace
 
 class FrameFix final : public IPlugin
 {
-    struct SegmentStats
-    {
-        double speedSum = 0.0;
-        double fpsSum = 0.0;
-        double moveSpeedSum = 0.0;
-        double animSpeedSum = 0.0;
-        double speedMin = 999999.0;
-        double speedMax = 0.0;
-        uint32_t samples = 0;
-
-        void reset()
-        {
-            speedSum = 0.0;
-            fpsSum = 0.0;
-            moveSpeedSum = 0.0;
-            animSpeedSum = 0.0;
-            speedMin = 999999.0;
-            speedMax = 0.0;
-            samples = 0;
-        }
-
-        void add(const double speed, const double fps, const double moveSpeed, const double animSpeed)
-        {
-            speedSum += speed;
-            fpsSum += fps;
-            moveSpeedSum += moveSpeed;
-            animSpeedSum += animSpeed;
-            speedMin = speed < speedMin ? speed : speedMin;
-            speedMax = speed > speedMax ? speed : speedMax;
-            ++samples;
-        }
-    };
-
 public:
     const char* GetName(void) const override
     {
@@ -1574,7 +1593,7 @@ public:
 
     double GetVersion(void) const override
     {
-        return 1.1;
+        return 1.2;
     }
 
     uint32_t GetFlags(void) const override
@@ -1645,7 +1664,6 @@ public:
         if (validDt)
         {
             update_animation_scalar_from_frame(dtMs);
-            update_ui_root_smoothing_from_frame(dtMs);
             update_chat_catchup(dtMs);
         }
 
@@ -1655,36 +1673,6 @@ public:
             update_ui_component_catchup(dtMs);
             update_ui_root_catchup(dtMs);
         }
-
-        if (!m_measureEnabled || !validDt)
-            return;
-
-        uint32_t index = 0xFFFFFFFF;
-        float x = 0.0f;
-        float z = 0.0f;
-        float y = 0.0f;
-        float moveSpeed = 0.0f;
-        float animSpeed = 0.0f;
-        if (!get_player_position(index, x, z, y, moveSpeed, animSpeed))
-            return;
-
-        if (m_hasLastPlayerPosition && index == m_lastPlayerIndex)
-        {
-            const double dx = static_cast<double>(x - m_lastPlayerX);
-            const double dz = static_cast<double>(z - m_lastPlayerZ);
-            const double dy = static_cast<double>(y - m_lastPlayerY);
-            const double measuredSpeed = std::sqrt(dx * dx + dz * dz + dy * dy) / (dtMs / 1000.0);
-            const double fps = 1000.0 / dtMs;
-
-            if (measuredSpeed > 0.01 && measuredSpeed < 20.0)
-                current_stats().add(measuredSpeed, fps, moveSpeed, animSpeed);
-        }
-
-        m_hasLastPlayerPosition = true;
-        m_lastPlayerIndex       = index;
-        m_lastPlayerX           = x;
-        m_lastPlayerZ           = z;
-        m_lastPlayerY           = y;
     }
 
     bool Direct3DSetRenderState(D3DRENDERSTATETYPE, DWORD*) override
@@ -1780,13 +1768,7 @@ public:
             return true;
         }
 
-        if (_strnicmp(args, "status", 6) == 0 || *args == '\0')
-        {
-            chat("FrameFix: %s", m_enabled ? "enabled" : "disabled");
-            return true;
-        }
-
-        chat("FrameFix usage: /framefix on | off | status");
+        chat("FrameFix usage: /framefix on | off");
         return true;
 
     }
@@ -1803,18 +1785,7 @@ private:
         if (g_addonStylePointerLocation == 0)
             find_addon_style_fps_pointer(g_addonStyleSignatureAddress, g_addonStylePointerLocation);
 
-        if (!m_sites.empty())
-            return true;
-
-        const auto addresses = find_time_scalar_functions();
-        for (const auto address : addresses)
-        {
-            PatchSite site{};
-            site.address = address;
-            m_sites.push_back(site);
-        }
-
-        return m_sites.size() == 2;
+        return true;
     }
 
     bool enable()
@@ -1829,8 +1800,6 @@ private:
         m_lockFps = true;
         set_fps_divisor(1);
         m_forceFpsFrames = 600;
-        m_timingHookMask = 3;
-        m_measureEnabled = false;
         g_cameraFixEnabled = false;
         g_cameraInitialized = false;
         g_cameraAdjustedFrames = 0;
@@ -1854,15 +1823,13 @@ private:
         restore_set_transform_hook();
         restore_camera_collision_substeps();
 
-        g_animationTimingMode = 0;
-        g_animationCompensation = 1.0f;
-        g_animationScalar = 1.0f;
-        g_animationRawScalar = 1.0f;
-        g_animationTargetScalar = 1.0f;
-        g_animationScalarInitialized = false;
+        reset_animation_scalar_state();
 
-        if (!apply_timing_hooks())
-            return false;
+        if (!patch_animation_frame_tick())
+            chat("FrameFix warning: motion frame hook was not found.");
+
+        if (!patch_animation_blend_tick())
+            chat("FrameFix warning: animation blend hook was not found.");
 
         if (!patch_ui_root_update())
             chat("FrameFix warning: UI root update hook was not found.");
@@ -1891,8 +1858,8 @@ private:
     bool disable()
     {
         bool ok = true;
-        for (auto& site : m_sites)
-            ok = restore_site(site) && ok;
+        ok = restore_animation_frame_tick() && ok;
+        ok = restore_animation_blend_tick() && ok;
 
         ok = restore_chat_root_update() && ok;
         ok = restore_native_chat_delay_catchup() && ok;
@@ -1921,36 +1888,40 @@ private:
         return ok;
     }
 
-    bool apply_timing_hooks()
+    bool patch_animation_frame_tick()
     {
-        bool ok = true;
-        for (size_t index = 0; index < m_sites.size(); ++index)
-        {
-            auto& site = m_sites[index];
-            const uint32_t bit = 1u << static_cast<uint32_t>(index);
-            if ((m_timingHookMask & bit) != 0)
-            {
-                if (!site.patched)
-                    ok = write_jump(site, reinterpret_cast<void*>(&real_time_scalar_hook)) && ok;
-            }
-            else if (site.patched)
-            {
-                ok = restore_site(site) && ok;
-            }
-        }
+        if (m_animationFrameTickCallSite.patched)
+            return true;
 
-        return ok;
+        const uintptr_t callsite = find_animation_frame_tick_callsite();
+        if (callsite == 0)
+            return false;
+
+        m_animationFrameTickCallSite.address = callsite;
+        return write_call(m_animationFrameTickCallSite, reinterpret_cast<void*>(&animation_frame_time_scalar_hook));
     }
 
-    uint32_t count_active_timing_hooks() const
+    bool restore_animation_frame_tick()
     {
-        uint32_t count = 0;
-        for (const auto& site : m_sites)
-        {
-            if (site.patched)
-                ++count;
-        }
-        return count;
+        return restore_site(m_animationFrameTickCallSite);
+    }
+
+    bool patch_animation_blend_tick()
+    {
+        if (m_animationBlendTickCallSite.patched)
+            return true;
+
+        const uintptr_t callsite = find_animation_blend_tick_callsite();
+        if (callsite == 0)
+            return false;
+
+        m_animationBlendTickCallSite.address = callsite;
+        return write_call(m_animationBlendTickCallSite, reinterpret_cast<void*>(&animation_blend_time_scalar_hook));
+    }
+
+    bool restore_animation_blend_tick()
+    {
+        return restore_site(m_animationBlendTickCallSite);
     }
 
     void pulse_framefix_lock()
@@ -2002,17 +1973,17 @@ private:
             return;
         }
 
-        g_uiComponentTickCarry += (dtMs * 60.0) / 1000.0;
-        auto ticks = static_cast<uint32_t>(std::floor(g_uiComponentTickCarry + 0.000001));
+        g_uiRootTickCarry += (dtMs * 60.0) / 1000.0;
+        auto ticks = static_cast<uint32_t>(std::floor(g_uiRootTickCarry + 0.000001));
         if (ticks == 0)
         {
             g_uiRootExtraPasses = 0;
             return;
         }
 
-        g_uiComponentTickCarry -= static_cast<double>(ticks);
-        if (g_uiComponentTickCarry < 0.0)
-            g_uiComponentTickCarry = 0.0;
+        g_uiRootTickCarry -= static_cast<double>(ticks);
+        if (g_uiRootTickCarry < 0.0)
+            g_uiRootTickCarry = 0.0;
 
         uint32_t extra = ticks > 1 ? ticks - 1 : 0;
         if (extra > 4)
@@ -2053,7 +2024,7 @@ private:
             return false;
 
         g_uiRootUpdateOriginal = original;
-        g_uiComponentTickCarry = 0.0;
+        g_uiRootTickCarry = 0.0;
         g_uiRootExtraPasses = 0;
         g_uiRootCatchupEnabled = true;
         return true;
@@ -2065,6 +2036,7 @@ private:
         g_uiRootCatchupEnabled = false;
         g_uiRootUpdateInside = false;
         g_uiRootExtraPasses = 0;
+        g_uiRootTickCarry = 0.0;
         g_uiRootUpdateOriginal = 0;
         return ok;
     }
@@ -2336,45 +2308,6 @@ private:
             --m_forceFpsFrames;
     }
 
-    bool get_player_position(uint32_t& index, float& x, float& z, float& y, float& moveSpeed, float& animSpeed)
-    {
-        if (m_core == nullptr || m_core->GetMemoryManager() == nullptr || m_core->GetMemoryManager()->GetEntity() == nullptr)
-            return false;
-
-        auto* entity = m_core->GetMemoryManager()->GetEntity();
-        const auto size = entity->GetEntityMapSize();
-        if (size == 0)
-            return false;
-
-        uint32_t found = 0xFFFFFFFF;
-        for (uint32_t i = 0; i < size; ++i)
-        {
-            const auto flags = entity->GetSpawnFlags(i);
-            if ((flags & 0x0200) == 0)
-                continue;
-
-            found = i;
-            break;
-        }
-
-        if (found == 0xFFFFFFFF)
-            return false;
-
-        index     = found;
-        x         = entity->GetLocalPositionX(found);
-        z         = entity->GetLocalPositionZ(found);
-        y         = entity->GetLocalPositionY(found);
-        moveSpeed = entity->GetMovementSpeed(found);
-        animSpeed = entity->GetAnimationSpeed(found);
-        return std::isfinite(x) && std::isfinite(z) && std::isfinite(y);
-    }
-
-    SegmentStats& current_stats()
-    {
-        return m_currentSegment == Segment::On ? m_onStats : m_offStats;
-    }
-
-
     void chat(const char* format, ...)
     {
         if (m_core == nullptr || m_core->GetChatManager() == nullptr)
@@ -2392,7 +2325,8 @@ private:
 private:
     IAshitaCore* m_core = nullptr;
     IDirect3DDevice8* m_device = nullptr;
-    std::vector<PatchSite> m_sites;
+    PatchSite m_animationFrameTickCallSite;
+    PatchSite m_animationBlendTickCallSite;
     PatchSite m_chatRootUpdateCallSite;
     BytesPatchSite m_nativeChatScrollSite;
     PatchSite m_uiComponentUpdateSite;
@@ -2401,29 +2335,13 @@ private:
     bool m_enabled = false;
     bool m_autoEnablePending = false;
 
-    enum class Segment
-    {
-        Off,
-        On,
-    };
-
     LARGE_INTEGER m_frequency{};
     LARGE_INTEGER m_lastCounter{};
-    SegmentStats m_offStats;
-    SegmentStats m_onStats;
-    Segment m_currentSegment = Segment::Off;
     bool m_chatCatchupEnabled = false;
-    uint32_t m_timingHookMask = 3;
     double m_chatCatchupCarry = 0.0;
-    bool m_measureEnabled = false;
     bool m_lockFps = false;
     int32_t m_desiredDivisor = 2;
     uint32_t m_forceFpsFrames = 0;
-    bool m_hasLastPlayerPosition = false;
-    uint32_t m_lastPlayerIndex = 0xFFFFFFFF;
-    float m_lastPlayerX = 0.0f;
-    float m_lastPlayerZ = 0.0f;
-    float m_lastPlayerY = 0.0f;
 };
 
 extern "C" __declspec(dllexport) IPlugin* __stdcall expCreatePlugin(const char*)
