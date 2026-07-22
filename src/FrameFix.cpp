@@ -1,6 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
 
-#include "../../Ashita/plugins/sdk/Ashita.h"
+#include "Ashita.h"
 
 #include <cctype>
 #include <intrin.h>
@@ -10,6 +10,7 @@
 #include <cstring>
 
 #pragma comment(linker, "/EXPORT:expCreatePlugin=_expCreatePlugin@4")
+#pragma comment(linker, "/EXPORT:expDestroyPlugin=_expDestroyPlugin@4")
 #pragma comment(linker, "/EXPORT:expGetInterfaceVersion=_expGetInterfaceVersion@0")
 #pragma comment(lib, "user32.lib")
 
@@ -1593,7 +1594,7 @@ public:
 
     double GetVersion(void) const override
     {
-        return 1.2;
+        return 1.3;
     }
 
     uint32_t GetFlags(void) const override
@@ -2347,6 +2348,11 @@ private:
 extern "C" __declspec(dllexport) IPlugin* __stdcall expCreatePlugin(const char*)
 {
     return new FrameFix();
+}
+
+extern "C" __declspec(dllexport) void __stdcall expDestroyPlugin(void* instance)
+{
+    delete static_cast<FrameFix*>(instance);
 }
 
 extern "C" __declspec(dllexport) double __stdcall expGetInterfaceVersion(void)
